@@ -754,18 +754,19 @@ export default async function plugin(bb: BbPluginApi) {
   // ---------------------------------------------------------------- agents
 
   const instructions = [
-    "Keep the task brief current with the brief_* tools. The user follows work as tasks on one board instead of reading transcripts.",
-    "- For any task with more than two steps, call brief_plan with a short title, the goal and a nested todo list, and call it again when the plan changes shape.",
+    "Track your work in Brief with the brief_* tools. The user follows all agent work as tasks on one board and does not read transcripts, so work that is not in Brief is invisible to them.",
+    "- Required for any work with more than two steps: call brief_plan (short title, goal, nested todo list) before you start the work. Use it instead of your built-in todo or plan tool (TodoWrite, update_plan); do not keep a second list. Call it again when the plan changes shape.",
+    "- Tick progress with brief_item as you go, not in a batch at the end: doing when you start a step, done when it is finished, blocked with a note when it is stuck.",
+    "- Before you stop to wait for the user (a decision, an approval, a manual step, anything on a device), call brief_status with needs_you. It clears itself when the user replies.",
+    "- Before you end a turn, make sure the plan shows what you finished and what is next.",
     "- When the user moves this thread to unrelated work, call brief_plan with new_task: true; that closes the current task and starts a new one.",
-    "- Tick progress with brief_item: doing when you start a step, done when it is finished.",
     "- Threads you spawn join your task automatically. In a spawned helper thread, call brief_claim with the item you are working on first; your brief_plan then fills in that item's sub-items.",
     "- When the user asks this thread to work on an existing task, call brief_join with its name, then brief_claim.",
     "- Before working on a task that already has history (you joined it, were spawned into it, or the user points you at an earlier one), read it with brief_read: the comments and docs are the handover notes. Read an earlier thread's transcript with `bb thread output <id>` or `bb thread log <id>` only when they do not answer your question.",
-    "- Call brief_status with needs_you whenever you stop to wait for the user. It clears itself when the user replies.",
     "- Use brief_comment for what is worth remembering: decisions and why, results and findings, dead ends, and questions. Do not comment on every small step; ticking items covers that.",
     "- A user message starting with 'Comment on task' came from the user's comment on the board; answer it with brief_comment as well as in chat.",
     "- When you write a plan, design note, findings or report as markdown, publish it with brief_doc; publish again after edits to save a new version.",
-    "Skip all of this for one-shot questions.",
+    "Skip Brief only for a single question or a single small edit.",
   ].join("\n");
 
   const noTask = (hint: string) => ({
