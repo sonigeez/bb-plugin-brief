@@ -239,6 +239,88 @@ function progressLine(plan: PlanItem[]): string {
   return `${all.filter(isFinished).length}/${all.length} done`;
 }
 
+const READ_EVENT_LIMIT = 150;
+
+/** UTC minute stamp, such as 2026-10-24 11:20Z. */
+function stamp(iso: string) {
+  return `${iso.slice(0, 10)} ${iso.slice(11, 16)}Z`;
+}
+
+const CHECK: Record<ItemStatus, string> = { todo: " ", doing: ">", done: "x", blocked: "!", skipped: "-" };
+
+/** The task as one markdown document: what the Brief tab shows, for agents. */
+export function renderTaskDocument(task: Task, events: TaskEvent[]): string {
+  const titles = new Map(task.threads.map((t) => [t.threadId, t.title]));
+  const commentCounts = new Map<string, number>();
+  for (const e of events) if (e.author !== "system" && e.itemId) commentCounts.set(e.itemId, (commentCounts.get(e.itemId) ?? 0) + 1);
+  const all = leaves(task.plan);
+  const out: string[] = [];
+  out.push(`# ${task.title}`, "");
+  out.push(
+    [
+      `Task ${task.id}`,
+      task.status,
+      task.projectName || task.projectId,
+      `${all.filter(isFinished).length}/${all.length} done`,
+      `started ${stamp(task.createdAt)}`,
+      ...(task.finishedAt ? [`finished ${stamp(task.finishedAt)}`] : []),
+    ].join(" · "),
+  );
+  if (task.goal) out.push("", `Goal: ${task.goal}`);
+
+  out.push("", "## Threads", "");
+  for (const t of task.threads) {
+    const facts = [t.role + (t.itemId ? ` on ${t.itemId}` : ""), t.threadId, t.runStatus === "gone" ? "archived or deleted" : t.runStatus];
+    if (t.left) facts.push("moved on");
+    out.push(`- **${t.title}** (${facts.join(", ")})`);
+    if (t.now) out.push(`  - Now: ${t.now}`);
+    if (t.needsYou) out.push(`  - Needs the user: ${t.needsYou}`);
+  }
+  out.push("", "Read a thread's history with `bb thread output <id>` (its final answer) or `bb thread log <id>` (the full log).");
+
+  if (task.plan.length) {
+    out.push("", "## Plan", "");
+    const plan = (items: PlanItem[], depth: number) => {
+      for (const item of items) {
+        const extras = [
+          ...item.threadIds.map((id) => titles.get(id) ?? id),
+          ...(commentCounts.get(item.id) ? [`${commentCounts.get(item.id)} comment(s)`] : []),
+        ];
+        out.push(
+          `${"  ".repeat(depth)}- [${CHECK[item.status]}] ${item.id} ${item.text}${extras.length ? ` (${extras.join("; ")})` : ""}`,
+        );
+        if (item.note) out.push(`${"  ".repeat(depth + 1)}- Note: ${item.note}`);
+        plan(item.children, depth + 1);
+      }
+    };
+    plan(task.plan, 0);
+    out.push("", "Legend: [ ] todo, [>] doing, [x] done, [!] blocked, [-] skipped.");
+  }
+
+  if (task.docs.length) {
+    out.push("", "## Documents", "");
+    for (const d of task.docs) {
+      out.push(`- ${d.title} (${d.kind}, v${d.versions}, doc ${d.id}, by ${titles.get(d.publishedBy) ?? d.publishedBy}, ${stamp(d.updatedAt)})`);
+    }
+    out.push("", "Read one with brief_read { doc: \"<doc id>\" }.");
+  }
+
+  if (events.length) {
+    out.push("", `## Activity (newest first, last ${events.length})`, "");
+    for (const e of events) {
+      const who = e.author === "user" ? "User" : e.author === "agent" ? (titles.get(e.threadId ?? "") ?? "Agent") : null;
+      if (!who) {
+        const by = e.threadId && task.threads.length > 1 ? ` (${titles.get(e.threadId) ?? e.threadId})` : "";
+        out.push(`- ${stamp(e.at)} ${e.text}${by}`);
+        continue;
+      }
+      const head = [stamp(e.at), `**${who}**`, ...(e.kind ? [e.kind] : []), ...(e.itemId ? [`on ${e.itemId}`] : [])].join(" · ");
+      out.push(`- ${head}`, ...e.text.split("\n").map((line) => `  > ${line}`));
+    }
+  }
+  return out.join("\n");
+}
+
 const MIGRATIONS = [
   `CREATE TABLE tasks (
     id TEXT PRIMARY KEY,
@@ -546,6 +628,27 @@ export default async function plugin(bb: BbPluginApi) {
     return { task };
   }
 
+  function taskEvents(taskId: string, limit: number): TaskEvent[] {
+    return db
+      .prepare<
+        [string, number],
+        { id: number; at: string; thread_id: string | null; text: string; author: TaskEvent["author"]; kind: CommentKind | null; item_id: string | null }
+      >("SELECT id, at, thread_id, text, author, kind, item_id FROM events WHERE task_id = ? ORDER BY id DESC LIMIT ?")
+      .all(taskId, limit)
+      .map((e) => ({ id: e.id, at: e.at, threadId: e.thread_id, author: e.author, kind: e.kind, itemId: e.item_id, text: e.text }));
+  }
+
+  /** Tasks matching an id or words from the title, this project's first. */
+  function findTasks(query: string, projectId: string, statuses: TaskRow["status"][]): TaskRow[] {
+    const rows = db
+      .prepare<[], TaskRow>(`SELECT * FROM tasks WHERE status IN (${statuses.map((st) => `'${st}'`).join(",")}) ORDER BY updated_at DESC`)
+      .all();
+    const byId = rows.filter((t) => t.id === query);
+    const matches = byId.length ? byId : rows.filter((t) => t.title.toLowerCase().includes(query.toLowerCase()));
+    const local = matches.filter((t) => t.project_id === projectId);
+    return local.length === 1 ? local : matches;
+  }
+
   function openTasks(): TaskRow[] {
     return db.prepare<[], TaskRow>("SELECT * FROM tasks WHERE status = 'open' ORDER BY updated_at DESC").all();
   }
@@ -620,6 +723,7 @@ export default async function plugin(bb: BbPluginApi) {
     "- Tick progress with brief_item: doing when you start a step, done when it is finished.",
     "- Threads you spawn join your task automatically. In a spawned helper thread, call brief_claim with the item you are working on first; your brief_plan then fills in that item's sub-items.",
     "- When the user asks this thread to work on an existing task, call brief_join with its name, then brief_claim.",
+    "- Before working on a task that already has history (you joined it, were spawned into it, or the user points you at an earlier one), read it with brief_read: the comments and docs are the handover notes. Read an earlier thread's transcript with `bb thread output <id>` or `bb thread log <id>` only when they do not answer your question.",
     "- Call brief_status with needs_you whenever you stop to wait for the user. It clears itself when the user replies.",
     "- Use brief_comment for what is worth remembering: decisions and why, results and findings, dead ends, and questions. Do not comment on every small step; ticking items covers that.",
     "- A user message starting with 'Comment on task' came from the user's comment on the board; answer it with brief_comment as well as in chat.",
@@ -767,12 +871,7 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({ task: z.string().min(1).describe("Task id or words from its title") }),
     async execute({ task: query }, { threadId, projectId }) {
       const open = openTasks();
-      const words = query.toLowerCase();
-      const byId = open.filter((t) => t.id === query);
-      const matches = byId.length ? byId : open.filter((t) => t.title.toLowerCase().includes(words));
-      // Prefer this project's tasks when a title matches in several projects.
-      const local = matches.filter((t) => t.project_id === projectId);
-      const picked = local.length === 1 ? local : matches;
+      const picked = findTasks(query, projectId, ["open"]);
       const list = (rows: TaskRow[]) =>
         rows.map((t) => `- ${t.id}  ${t.title} (${progressLine(JSON.parse(t.plan))})`).join("\n") || "(no open tasks)";
       if (picked.length !== 1) {
@@ -784,6 +883,49 @@ export default async function plugin(bb: BbPluginApi) {
       changed();
       const plan = JSON.parse(result.task.plan) as PlanItem[];
       return `Joined task "${result.task.title}". Claim the item you work on with brief_claim. Plan:\n${renderPlan(plan)}`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "brief_read",
+    description:
+      "Read a task as one markdown document, the same content the user sees in the Brief tab: goal, progress, every thread that worked on it (with thread ids), the plan with statuses and notes, the documents, and the activity feed with all comments. Defaults to this thread's current task; pass task (id or words from the title) to read another, including finished ones. Pass doc (a document id from that list) to read a published document's saved content instead.",
+    presentation: { label: { pending: "Reading task", completed: "Read task" }, icon: { glyph: "BookOpen" } },
+    parameters: z.object({
+      task: z.string().optional().describe("Task id or words from its title. Omit for this thread's current task."),
+      doc: z.string().optional().describe("Document id, to read that document's content"),
+      version: z.number().int().min(1).optional().describe("Document version; omit for the latest"),
+      activity: z.enum(["all", "comments", "none"]).default("all").describe("comments drops the plugin's automatic lines"),
+    }),
+    async execute({ task: query, doc: docId, version, activity }, { threadId, projectId }) {
+      const fail = (text: string) => ({ content: [{ type: "text" as const, text }], isError: true });
+      if (docId) {
+        const doc = db.prepare<[string], DocRow>("SELECT * FROM docs WHERE id = ?").get(docId);
+        if (!doc) return fail(`No document ${docId}.`);
+        const wanted = version ?? doc.versions;
+        const saved = db
+          .prepare<[string, number], { content: string; saved_at: string }>("SELECT content, saved_at FROM doc_versions WHERE doc_id = ? AND version = ?")
+          .get(docId, wanted);
+        if (!saved) return fail(`${doc.title} has no version ${wanted}; it has ${doc.versions}.`);
+        return `# ${doc.title}\n\n${doc.kind} · v${wanted} of ${doc.versions} · saved ${stamp(saved.saved_at)} · path ${doc.path ?? "none"}\n\n---\n\n${saved.content}`;
+      }
+      let row: TaskRow | undefined;
+      if (query) {
+        const matches = findTasks(query, projectId, ["open", "done", "dropped"]);
+        if (matches.length !== 1) {
+          const list = matches.length ? matches : findTasks("", projectId, ["open", "done", "dropped"]).slice(0, 20);
+          const lines = list.map((t) => `- ${t.id}  ${t.title} (${t.status}, ${progressLine(JSON.parse(t.plan))})`).join("\n");
+          return fail(`${matches.length ? `Several tasks match "${query}"; pass an id.` : `No task matches "${query}".`} Tasks:\n${lines || "(none)"}`);
+        }
+        row = matches[0];
+      } else {
+        const link = await linkFor(threadId);
+        if (!link) return fail("This thread is not on a task. Pass task to read one by name, or call brief_plan to start one.");
+        row = q.task.get(link.task_id);
+      }
+      const task = toTask(row!, await context());
+      const events = activity === "none" ? [] : taskEvents(task.id, READ_EVENT_LIMIT).filter((e) => activity === "all" || e.author !== "system");
+      return renderTaskDocument(task, events);
     },
   });
 
@@ -959,14 +1101,7 @@ export default async function plugin(bb: BbPluginApi) {
     task_get: async ({ taskId }) => {
       const row = q.task.get(taskId);
       if (!row) throw new Error("Task not found.");
-      const events = db
-        .prepare<
-          [string],
-          { id: number; at: string; thread_id: string | null; text: string; author: TaskEvent["author"]; kind: CommentKind | null; item_id: string | null }
-        >("SELECT id, at, thread_id, text, author, kind, item_id FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 300")
-        .all(taskId)
-        .map((e) => ({ id: e.id, at: e.at, threadId: e.thread_id, author: e.author, kind: e.kind, itemId: e.item_id, text: e.text }));
-      return { task: toTask(row, await context()), events };
+      return { task: toTask(row, await context()), events: taskEvents(taskId, 300) };
     },
     comment_add: async ({ taskId, text, itemId }) => {
       const task = q.task.get(taskId);

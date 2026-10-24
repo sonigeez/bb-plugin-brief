@@ -171,3 +171,38 @@ test("agents and you comment on a task; your comments reach the owner", async ()
   );
   assert.ok(events.some((e) => e.author === "system" && /Task started/.test(e.text)));
 });
+
+test("agents read a task as the document the Brief tab shows", async () => {
+  const b = await setup();
+  await b.callAgentTool("brief_plan", { title: "Ship v2", goal: "Tasks on the board", items: [{ text: "Server", note: "SQLite" }, { text: "UI", children: [{ text: "Board" }] }] }, owner);
+  await b.callAgentTool("brief_claim", { item: "2.1" }, helper);
+  await b.callAgentTool("brief_status", { now: "Building cards", needs_you: "Pick a color" }, helper);
+  await b.callAgentTool("brief_comment", { text: "Cards wrap below 400px.\nUsing a grid.", kind: "finding", item: "2.1" }, helper);
+  await b.callAgentTool("brief_doc", { path: "ui.md", title: "UI notes", kind: "design" }, helper);
+
+  // Any thread on the task, here the owner, reads it by default.
+  const doc = text(await b.callAgentTool("brief_read", {}, owner));
+  assert.match(doc, /^# Ship v2/);
+  assert.match(doc, /Goal: Tasks on the board/);
+  assert.match(doc, /\*\*UI helper\*\* \(helper on 2\.1, thr_helper, active\)/);
+  assert.match(doc, /Needs the user: Pick a color/);
+  assert.match(doc, /- \[ \] 1 Server\n  - Note: SQLite/);
+  assert.match(doc, /- \[>\] 2\.1 Board \(UI helper; 1 comment\(s\)\)/);
+  assert.match(doc, /\*\*UI helper\*\* · finding · on 2\.1\n  > Cards wrap below 400px\.\n  > Using a grid\./);
+  assert.match(doc, /Task started: Ship v2/);
+  const docId = /doc ([a-f0-9-]{12})/.exec(doc)![1]!;
+
+  const comments = text(await b.callAgentTool("brief_read", { activity: "comments" }, owner));
+  assert.doesNotMatch(comments, /Task started/);
+
+  const content = text(await b.callAgentTool("brief_read", { doc: docId }, owner));
+  assert.match(content, /^# UI notes\n\ndesign · v1 of 1/);
+  assert.match(content, /# ui\.md$/);
+
+  // A thread on no task can read any task by name, finished ones too.
+  await b.callAgentTool("brief_item", { updates: [{ id: "1", status: "done" }, { id: "2.1", status: "done" }] }, owner);
+  const loose = { threadId: "thr_other", projectId: "proj_a" };
+  assert.match(text(await b.callAgentTool("brief_read", { task: "ship" }, loose)), /Task [a-f0-9-]{12} · done/);
+  const none = (await b.callAgentTool("brief_read", {}, loose)) as { isError: boolean };
+  assert.equal(none.isError, true);
+});

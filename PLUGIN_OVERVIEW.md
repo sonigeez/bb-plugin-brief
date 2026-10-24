@@ -35,7 +35,9 @@ and the old one is kept in Done so far.
 `brief_plan` (start a task or set its plan; `new_task` to switch),
 `brief_item` (tick items), `brief_claim` (a helper takes an item), `brief_join` (join an open task by
 name),
-`brief_comment` (add a comment to the activity feed), `brief_status` (the now line and the needs-you flag, which clears itself when
+`brief_comment` (add a comment to the activity feed), `brief_read` (read a
+task as one markdown document, the same content as the Brief tab, including
+thread ids and every comment, or read a published doc), `brief_status` (the now line and the needs-you flag, which clears itself when
 you reply), and `brief_doc` (publish a markdown file).
 
 ## How it works
