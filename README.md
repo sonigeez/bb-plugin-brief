@@ -25,7 +25,11 @@ it, and what it needs from you, on one board.
 
 A thread starts a task when it plans multi-step work. Threads it spawns join
 that task automatically and can claim a checklist item, filling in that
-item's sub-steps. A thread you start yourself can join an open task too:
+item's sub-steps. You can also start a helper yourself: hover a checklist item and click
+**Start thread**. The new thread is already on the task, has claimed that
+item, and reads the task before it starts. It runs in a new workspace, or in
+the lead thread's workspace if you choose that. A thread you start yourself
+can join an open task too:
 ask it to work on the task by name, or pick the task under **Join a task**
 in the thread's Brief panel. A thread that moves on to unrelated work starts a new task,
 and the old one is kept in Done so far.

@@ -138,6 +138,16 @@ export const rpcContract = defineRpcContract({
       joinable: z.array(taskSchema),
     }),
   },
+  /** Start a new helper thread on a plan item: already on the task, item claimed. */
+  item_spawn: {
+    input: z.object({
+      taskId: z.string(),
+      itemId: z.string(),
+      note: z.string().trim().max(4000).nullable(),
+      workspace: z.enum(["new", "lead"]),
+    }),
+    output: z.object({ threadId: z.string() }),
+  },
   thread_join: {
     input: z.object({ threadId: z.string(), taskId: z.string() }),
     output: z.object({ ok: z.boolean() }),
@@ -319,6 +329,16 @@ export function renderTaskDocument(task: Task, events: TaskEvent[]): string {
     }
   }
   return out.join("\n");
+}
+
+function helperPrompt(task: { id: string; title: string }, item: PlanItem, note: string | null): string {
+  return [
+    `You are a helper on the task "${task.title}" (task ${task.id}), working on plan item ${item.id}: ${item.text}.`,
+    "",
+    "Start by calling brief_read to catch up on the task: its goal, plan, comments and documents. You are already on the task and have already claimed this item, so do not call brief_join or brief_claim.",
+    "Plan your own sub-steps with brief_plan (they go under your item), tick them with brief_item, record decisions and findings with brief_comment, and set needs_you with brief_status whenever you need the user.",
+    ...(note ? ["", "From the user:", note] : []),
+  ].join("\n");
 }
 
 const MIGRATIONS = [
@@ -649,6 +669,23 @@ export default async function plugin(bb: BbPluginApi) {
     return local.length === 1 ? local : matches;
   }
 
+  /** Put a thread on a plan item: its dot shows there and its sub-plan goes under it. */
+  function claimItem(taskId: string, threadId: string, itemId: string): { text: string } | { error: string } {
+    const task = q.task.get(taskId)!;
+    const plan = JSON.parse(task.plan) as PlanItem[];
+    const item = findItem(plan, itemId);
+    if (!item) return { error: `No plan item ${itemId}. Current plan:\n${renderPlan(plan)}` };
+    walk(plan, (other) => {
+      other.threadIds = other.threadIds.filter((id) => id !== threadId);
+    });
+    item.threadIds.push(threadId);
+    if (item.status === "todo") item.status = "doing";
+    savePlan(task, plan);
+    db.prepare("UPDATE task_threads SET item_id = ? WHERE task_id = ? AND thread_id = ?").run(itemId, task.id, threadId);
+    addEvent(task.id, threadId, `Claimed ${item.id}: ${item.text}`);
+    return { text: `Claimed ${item.id} "${item.text}" on task "${task.title}".` };
+  }
+
   function openTasks(): TaskRow[] {
     return db.prepare<[], TaskRow>("SELECT * FROM tasks WHERE status = 'open' ORDER BY updated_at DESC").all();
   }
@@ -843,21 +880,7 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ item: itemId }, { threadId }) {
       const link = await linkFor(threadId);
       if (!link) return noTask("Only threads spawned from a task thread can claim items; call brief_plan with a title to start your own task.");
-      const result = db.transaction(() => {
-        const task = q.task.get(link.task_id)!;
-        const plan = JSON.parse(task.plan) as PlanItem[];
-        const item = findItem(plan, itemId);
-        if (!item) return { error: `No plan item ${itemId}. Current plan:\n${renderPlan(plan)}` };
-        walk(plan, (other) => {
-          other.threadIds = other.threadIds.filter((id) => id !== threadId);
-        });
-        item.threadIds.push(threadId);
-        if (item.status === "todo") item.status = "doing";
-        savePlan(task, plan);
-        db.prepare("UPDATE task_threads SET item_id = ? WHERE task_id = ? AND thread_id = ?").run(itemId, task.id, threadId);
-        addEvent(task.id, threadId, `Claimed ${item.id}: ${item.text}`);
-        return { text: `Claimed ${item.id} "${item.text}" on task "${task.title}".` };
-      })();
+      const result = db.transaction(() => claimItem(link.task_id, threadId, itemId))();
       changed();
       return "error" in result ? { content: [{ type: "text", text: result.error! }], isError: true } : result.text!;
     },
@@ -1144,6 +1167,33 @@ export default async function plugin(bb: BbPluginApi) {
         earlier: rows.filter((row) => row !== current).map((row) => toTask(row, ctx)),
         joinable: joinable.map((row) => toTask(row, ctx)),
       };
+    },
+    item_spawn: async ({ taskId, itemId, note, workspace }) => {
+      const task = q.task.get(taskId);
+      if (!task || task.status !== "open") throw new Error("That task is not open.");
+      const item = findItem(JSON.parse(task.plan) as PlanItem[], itemId);
+      if (!item) throw new Error(`No plan item ${itemId}.`);
+      let environment: { type: "project-default" } | { type: "reuse"; environmentId: string } = { type: "project-default" };
+      if (workspace === "lead") {
+        const lead = await bb.sdk.threads.get({ threadId: task.owner_thread_id });
+        if (!lead.environmentId) throw new Error("The lead thread has no workspace to share.");
+        environment = { type: "reuse", environmentId: lead.environmentId };
+      }
+      const thread = await bb.sdk.threads.spawn({
+        projectId: task.project_id,
+        environment,
+        title: `${item.id} ${item.text}`.slice(0, 80),
+        prompt: helperPrompt(task, item, note),
+      });
+      // The agent needs a few seconds to start, so the link is in place
+      // before its first brief_* call.
+      db.transaction(() => {
+        q.insertLink.run(task.id, thread.id, "helper", nowIso());
+        addEvent(task.id, thread.id, `You started a helper thread for ${item.id}`);
+        claimItem(task.id, thread.id, item.id);
+      })();
+      changed();
+      return { threadId: thread.id };
     },
     thread_join: async ({ threadId, taskId }) => {
       const result = db.transaction(() => joinTask(threadId, taskId))();

@@ -49,6 +49,10 @@ function useTick() {
 
 // --------------------------------------------------------------- helpers
 
+function isDone(item: PlanItem) {
+  return item.status === "done" || item.status === "skipped";
+}
+
 function leaves(items: PlanItem[]): PlanItem[] {
   return items.flatMap((item) => (item.children.length ? leaves(item.children) : [item]));
 }
@@ -167,8 +171,69 @@ function ErrorText({ children }: { children: ReactNode }) {
 
 // ------------------------------------------------------------- plan tree
 
-/** On the task page, items show their comment count and open their comments. */
+/**
+ * On the task page and in the Brief panel, items show their comment count
+ * (which opens their comments) and a Start thread action.
+ */
 const ItemComments = createContext<{ counts: Map<string, number>; select: (itemId: string) => void } | null>(null);
+
+function StartThreadForm({ task, item, onDone }: { task: Task; item: PlanItem; onDone: () => void }) {
+  const rpc = useBrief();
+  const navigate = useBbNavigate();
+  const [note, setNote] = useState("");
+  const [workspace, setWorkspace] = useState<"new" | "lead">("new");
+  const [pending, setPending] = useState(false);
+  const start = async () => {
+    setPending(true);
+    try {
+      const { threadId } = await rpc.call("item_spawn", {
+        taskId: task.id,
+        itemId: item.id,
+        note: note.trim() || null,
+        workspace,
+      });
+      onDone();
+      navigate.toThread(threadId, { split: true });
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <div className="my-1 ml-6 space-y-2 rounded-md border border-border bg-muted/30 p-2">
+      <p className="text-xs text-muted-foreground">
+        Starts a thread on this task that has claimed {item.id} and reads the task first.
+      </p>
+      <textarea
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        rows={2}
+        placeholder="Anything else it should know (optional)"
+        className="w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        aria-label="Instructions for the new thread"
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          value={workspace}
+          onChange={(event) => setWorkspace(event.target.value as "new" | "lead")}
+          className="h-7 rounded-md border border-border bg-background px-2 text-xs"
+          aria-label="Workspace"
+        >
+          <option value="new">New workspace</option>
+          <option value="lead">Lead thread's workspace</option>
+        </select>
+        <span className="flex-1" />
+        <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={onDone}>
+          Cancel
+        </Button>
+        <Button size="sm" className="h-7 text-xs" disabled={pending} onClick={() => void start()}>
+          Start thread
+        </Button>
+      </div>
+    </div>
+  );
+}
 
 function PlanTree({
   task,
@@ -188,6 +253,8 @@ function PlanTree({
   };
   const threadsById = new Map(task.threads.map((t) => [t.threadId, t]));
   const comments = useContext(ItemComments);
+  const [starting, setStarting] = useState<string | null>(null);
+  const canStart = comments !== null && task.status === "open";
   return (
     <ul className={cn("space-y-0.5", depth > 0 && "ml-5 border-l border-border pl-2")}>
       {items.map((item) => {
@@ -196,7 +263,7 @@ function PlanTree({
         const workers = item.threadIds.map((id) => threadsById.get(id)).filter((t): t is TaskThread => t !== undefined);
         return (
           <li key={item.id}>
-            <div className={cn("flex items-start gap-2 rounded py-0.5 text-sm", item.id === highlightItemId && "bg-primary/10 px-1")}>
+            <div className={cn("group flex items-start gap-2 rounded py-0.5 text-sm", item.id === highlightItemId && "bg-primary/10 px-1")}>
               <button
                 type="button"
                 disabled={!leaf}
@@ -234,7 +301,19 @@ function PlanTree({
                 ) : null}
                 {item.note ? <p className="text-xs text-muted-foreground">{item.note}</p> : null}
               </div>
+              {canStart && !isDone(item) ? (
+                <button
+                  type="button"
+                  onClick={() => setStarting(starting === item.id ? null : item.id)}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground focus:opacity-100 group-hover:opacity-100"
+                  aria-label={`Start a thread for ${item.id}`}
+                  title="Start a thread for this item"
+                >
+                  <Icon name="GitBranchPlus" fallback="Plus" className="size-3.5" />
+                </button>
+              ) : null}
             </div>
+            {starting === item.id ? <StartThreadForm task={task} item={item} onDone={() => setStarting(null)} /> : null}
             {item.children.length ? (
               <PlanTree task={task} items={item.children} highlightItemId={highlightItemId} depth={depth + 1} />
             ) : null}

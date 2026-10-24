@@ -14,6 +14,7 @@ const threads = [
 ];
 
 const sent: { threadId: string; text: string }[] = [];
+const spawned: { environment: unknown; title: string; prompt: string }[] = [];
 
 async function setup(seed?: (kv: Map<string, unknown>) => void) {
   const kvSeed = new Map<string, unknown>();
@@ -24,6 +25,10 @@ async function setup(seed?: (kv: Map<string, unknown>) => void) {
       threads: {
         get: async ({ threadId }: { threadId: string }) => threads.find((t) => t.id === threadId)!,
         list: async () => threads,
+        spawn: async (args: { environment: unknown; title: string; prompt: string }) => {
+          spawned.push(args);
+          return makeThreadResponse({ id: `thr_spawn${spawned.length}`, projectId: "proj_a" });
+        },
         send: async ({ threadId, input }: { threadId: string; input: { text: string }[] }) => {
           sent.push({ threadId, text: input[0]!.text });
           return {};
@@ -205,4 +210,30 @@ test("agents read a task as the document the Brief tab shows", async () => {
   assert.match(text(await b.callAgentTool("brief_read", { task: "ship" }, loose)), /Task [a-f0-9-]{12} · done/);
   const none = (await b.callAgentTool("brief_read", {}, loose)) as { isError: boolean };
   assert.equal(none.isError, true);
+});
+
+test("you start a helper thread from a plan item", async () => {
+  const b = await setup();
+  await b.callAgentTool("brief_plan", { title: "Ship v2", items: [{ text: "Server" }, { text: "UI", children: [{ text: "Board" }] }] }, owner);
+  const { tasks } = (await b.callRpc("board", null)) as { tasks: Task[] };
+  const taskId = tasks[0]!.id;
+
+  const { threadId } = (await b.callRpc("item_spawn", { taskId, itemId: "2.1", note: "Use the grid layout", workspace: "lead" })) as { threadId: string };
+  const call = spawned.at(-1)!;
+  assert.deepEqual(call.environment, { type: "reuse", environmentId: "env_a" });
+  assert.equal(call.title, "2.1 Board");
+  assert.match(call.prompt, /plan item 2\.1: Board/);
+  assert.match(call.prompt, /calling brief_read/);
+  assert.match(call.prompt, /From the user:\nUse the grid layout$/);
+
+  const { task } = (await b.callRpc("task_get", { taskId })) as { task: Task };
+  const helperRow = task.threads.find((t) => t.threadId === threadId)!;
+  assert.equal(helperRow.role, "helper");
+  assert.equal(helperRow.itemId, "2.1");
+  assert.equal(task.plan[1]!.children[0]!.status, "doing");
+  assert.deepEqual(task.plan[1]!.children[0]!.threadIds, [threadId]);
+
+  await b.callRpc("item_spawn", { taskId, itemId: "1", note: null, workspace: "new" });
+  assert.deepEqual(spawned.at(-1)!.environment, { type: "project-default" });
+  await assert.rejects(b.callRpc("item_spawn", { taskId, itemId: "9", note: null, workspace: "new" }));
 });
