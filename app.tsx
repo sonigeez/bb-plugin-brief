@@ -471,7 +471,19 @@ function TasksView() {
   );
 }
 
-function TaskPage({ taskId }: { taskId: string }) {
+/**
+ * A task with its checklist and Activity feed (comments and comment box),
+ * loaded live. Shared by the task page and the thread's Brief panel.
+ */
+function TaskWithActivity({
+  taskId,
+  highlightItemId,
+  header,
+}: {
+  taskId: string;
+  highlightItemId?: string | null;
+  header: (task: Task) => ReactNode;
+}) {
   const rpc = useBrief();
   const load = useCallback(() => rpc.call("task_get", { taskId }), [rpc, taskId]);
   const { data, error } = useLive(load);
@@ -482,21 +494,32 @@ function TaskPage({ taskId }: { taskId: string }) {
   const { task, events } = data;
   return (
     <div className="space-y-5">
-      <div>
-        <div className="flex items-center gap-2">
-          <h2 className="min-w-0 flex-1 truncate text-base font-medium">{task.title}</h2>
-          <StatusBadge task={task} />
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {task.projectName} · started {ago(task.createdAt)}
-          {task.finishedAt ? ` · finished ${ago(task.finishedAt)}` : ""}
-        </p>
-      </div>
+      {header(task)}
       <ItemComments.Provider value={{ counts: commentCounts(events), select: setItemFilter }}>
-        <TaskBody task={task} />
+        <TaskBody task={task} highlightItemId={highlightItemId} />
       </ItemComments.Provider>
       <ActivityFeed task={task} events={events} itemFilter={itemFilter} onClearFilter={() => setItemFilter(null)} />
     </div>
+  );
+}
+
+function TaskPage({ taskId }: { taskId: string }) {
+  return (
+    <TaskWithActivity
+      taskId={taskId}
+      header={(task) => (
+        <div>
+          <div className="flex items-center gap-2">
+            <h2 className="min-w-0 flex-1 truncate text-base font-medium">{task.title}</h2>
+            <StatusBadge task={task} />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {task.projectName} · started {ago(task.createdAt)}
+            {task.finishedAt ? ` · finished ${ago(task.finishedAt)}` : ""}
+          </p>
+        </div>
+      )}
+    />
   );
 }
 
@@ -893,29 +916,32 @@ function ThreadBriefPanel({ threadId }: { threadId: string }) {
   return (
     <div className="space-y-6">
       {current ? (
-        <div className="space-y-3">
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              className="min-w-0 flex-1 truncate text-left text-base font-medium hover:underline"
-              onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: `task/${current.id}` })}
-            >
-              {current.title}
-            </button>
-            <StatusBadge task={current} />
-            {own?.role === "helper" ? (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 text-xs text-muted-foreground"
-                onClick={() => void rpc.call("thread_leave", { threadId }).catch((cause: unknown) => toast.error(String(cause)))}
+        <TaskWithActivity
+          taskId={current.id}
+          highlightItemId={own?.itemId ?? null}
+          header={(task) => (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="min-w-0 flex-1 truncate text-left text-base font-medium hover:underline"
+                onClick={() => navigate.toPluginPanel(PANEL_PATH, { subPath: `task/${task.id}` })}
               >
-                Leave task
-              </Button>
-            ) : null}
-          </div>
-          <TaskBody task={current} highlightItemId={own?.itemId ?? null} />
-        </div>
+                {task.title}
+              </button>
+              <StatusBadge task={task} />
+              {own?.role === "helper" ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 shrink-0 text-xs text-muted-foreground"
+                  onClick={() => void rpc.call("thread_leave", { threadId }).catch((cause: unknown) => toast.error(String(cause)))}
+                >
+                  Leave task
+                </Button>
+              ) : null}
+            </div>
+          )}
+        />
       ) : (
         <div className="space-y-3">
           <EmptyState>This thread is on no task. The agent starts one when it plans multi-step work, or join one below.</EmptyState>
