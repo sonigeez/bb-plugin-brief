@@ -75,7 +75,23 @@ const taskSchema = z.object({
 });
 export type Task = z.infer<typeof taskSchema>;
 
-const eventSchema = z.object({ at: z.string(), threadId: z.string().nullable(), text: z.string() });
+const commentKindSchema = z.enum(["update", "decision", "finding", "question"]);
+export type CommentKind = z.infer<typeof commentKindSchema>;
+
+/**
+ * One line of the task's activity. `author: "system"` lines are written by the
+ * plugin itself (item ticked, thread joined); "agent" and "user" lines are
+ * comments, with a markdown `text`, a `kind`, and optionally the item they are about.
+ */
+const eventSchema = z.object({
+  id: z.number(),
+  at: z.string(),
+  threadId: z.string().nullable(),
+  author: z.enum(["system", "agent", "user"]),
+  kind: commentKindSchema.nullable(),
+  itemId: z.string().nullable(),
+  text: z.string(),
+});
 export type TaskEvent = z.infer<typeof eventSchema>;
 
 const untrackedSchema = z.object({
@@ -102,6 +118,15 @@ export const rpcContract = defineRpcContract({
   task_get: {
     input: z.object({ taskId: z.string() }),
     output: z.object({ task: taskSchema, events: z.array(eventSchema) }),
+  },
+  /** Your comment on a task; it is also sent to the task's owner thread. */
+  comment_add: {
+    input: z.object({
+      taskId: z.string(),
+      text: z.string().trim().min(1).max(4000),
+      itemId: z.string().nullable(),
+    }),
+    output: z.object({ delivered: z.boolean(), error: z.string().nullable() }),
   },
   /** The thread's current task and its earlier ones. */
   thread_tasks: {
@@ -264,6 +289,10 @@ const MIGRATIONS = [
     text TEXT NOT NULL
   );
   CREATE INDEX events_task ON events (task_id, id);`,
+  // Comments live in the same timeline as the plugin's own activity lines.
+  `ALTER TABLE events ADD COLUMN author TEXT NOT NULL DEFAULT 'system';
+  ALTER TABLE events ADD COLUMN kind TEXT;
+  ALTER TABLE events ADD COLUMN item_id TEXT;`,
 ];
 
 type TaskRow = {
@@ -327,6 +356,9 @@ export default async function plugin(bb: BbPluginApi) {
        ON CONFLICT (task_id, thread_id) DO UPDATE SET left_at = NULL`,
     ),
     event: db.prepare("INSERT INTO events (task_id, thread_id, at, text) VALUES (?, ?, ?, ?)"),
+    comment: db.prepare(
+      "INSERT INTO events (task_id, thread_id, at, text, author, kind, item_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ),
   };
 
   function addEvent(taskId: string, threadId: string | null, text: string) {
@@ -589,6 +621,8 @@ export default async function plugin(bb: BbPluginApi) {
     "- Threads you spawn join your task automatically. In a spawned helper thread, call brief_claim with the item you are working on first; your brief_plan then fills in that item's sub-items.",
     "- When the user asks this thread to work on an existing task, call brief_join with its name, then brief_claim.",
     "- Call brief_status with needs_you whenever you stop to wait for the user. It clears itself when the user replies.",
+    "- Use brief_comment for what is worth remembering: decisions and why, results and findings, dead ends, and questions. Do not comment on every small step; ticking items covers that.",
+    "- A user message starting with 'Comment on task' came from the user's comment on the board; answer it with brief_comment as well as in chat.",
     "- When you write a plan, design note, findings or report as markdown, publish it with brief_doc; publish again after edits to save a new version.",
     "Skip all of this for one-shot questions.",
   ].join("\n");
@@ -754,6 +788,32 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "brief_comment",
+    description:
+      "Add a comment to the task's activity: a decision and why, a finding or result, a dead end worth remembering, an update for the user, or a question. Markdown, a few lines. Optionally attach it to a plan item.",
+    presentation: { label: { pending: "Commenting on task", completed: "Commented on task" }, icon: { glyph: "MessageSquare" } },
+    parameters: z.object({
+      text: z.string().min(1).max(4000),
+      kind: commentKindSchema.default("update"),
+      item: z.string().optional().describe("Plan item id the comment is about, such as 2.1"),
+    }),
+    async execute({ text, kind, item }, { threadId }) {
+      const link = await linkFor(threadId);
+      if (!link) return noTask("Call brief_plan with a title to start one.");
+      if (item) {
+        const plan = JSON.parse(q.task.get(link.task_id)!.plan) as PlanItem[];
+        if (!findItem(plan, item)) {
+          return { content: [{ type: "text", text: `No plan item ${item}. Current plan:\n${renderPlan(plan)}` }], isError: true };
+        }
+      }
+      q.comment.run(link.task_id, threadId, nowIso(), text, "agent", kind, item ?? null);
+      touch(link.task_id);
+      changed();
+      return "Comment added.";
+    },
+  });
+
+  bb.agents.registerTool({
     name: "brief_status",
     description:
       "Set this thread's one-line 'now' status (what you are doing right now) and/or its 'needs you' flag (what you are waiting on from the user). Pass needs_you: null to clear it.",
@@ -900,12 +960,35 @@ export default async function plugin(bb: BbPluginApi) {
       const row = q.task.get(taskId);
       if (!row) throw new Error("Task not found.");
       const events = db
-        .prepare<[string], { at: string; thread_id: string | null; text: string }>(
-          "SELECT at, thread_id, text FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 50",
-        )
+        .prepare<
+          [string],
+          { id: number; at: string; thread_id: string | null; text: string; author: TaskEvent["author"]; kind: CommentKind | null; item_id: string | null }
+        >("SELECT id, at, thread_id, text, author, kind, item_id FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 300")
         .all(taskId)
-        .map((e) => ({ at: e.at, threadId: e.thread_id, text: e.text }));
+        .map((e) => ({ id: e.id, at: e.at, threadId: e.thread_id, author: e.author, kind: e.kind, itemId: e.item_id, text: e.text }));
       return { task: toTask(row, await context()), events };
+    },
+    comment_add: async ({ taskId, text, itemId }) => {
+      const task = q.task.get(taskId);
+      if (!task) throw new Error("Task not found.");
+      const plan = JSON.parse(task.plan) as PlanItem[];
+      const item = itemId ? findItem(plan, itemId) : null;
+      if (itemId && !item) throw new Error(`No plan item ${itemId}.`);
+      q.comment.run(taskId, null, nowIso(), text, "user", null, itemId);
+      touch(taskId);
+      changed();
+      // Queue it for the owner so it never interrupts a running turn.
+      const about = item ? ` (item ${item.id}: ${item.text})` : "";
+      try {
+        await bb.sdk.threads.send({
+          threadId: task.owner_thread_id,
+          mode: "queue-if-active",
+          input: [{ type: "text", mentions: [], text: `Comment on task "${task.title}"${about}:\n\n${text}` }],
+        });
+        return { delivered: true, error: null };
+      } catch (cause) {
+        return { delivered: false, error: cause instanceof Error ? cause.message : String(cause) };
+      }
     },
     thread_tasks: async ({ threadId }) => {
       const ctx = await context();

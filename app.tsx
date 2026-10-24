@@ -2,10 +2,10 @@
 // page, Done so far, and the docs library. In a thread, the side panel shows
 // the thread's current task and its earlier ones. Everything refetches on the
 // server's "brief-changed" signal.
-import { useCallback, useEffect, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Markdown, definePluginApp, useBbNavigate, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { DocMeta, ItemStatus, PlanItem, Task, TaskEvent, TaskThread, Untracked, rpcContract } from "./server";
+import type { CommentKind, DocMeta, ItemStatus, PlanItem, Task, TaskEvent, TaskThread, Untracked, rpcContract } from "./server";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -167,6 +167,9 @@ function ErrorText({ children }: { children: ReactNode }) {
 
 // ------------------------------------------------------------- plan tree
 
+/** On the task page, items show their comment count and open their comments. */
+const ItemComments = createContext<{ counts: Map<string, number>; select: (itemId: string) => void } | null>(null);
+
 function PlanTree({
   task,
   items,
@@ -184,6 +187,7 @@ function PlanTree({
     void rpc.call("item_set_status", { taskId: task.id, itemId: item.id, status });
   };
   const threadsById = new Map(task.threads.map((t) => [t.threadId, t]));
+  const comments = useContext(ItemComments);
   return (
     <ul className={cn("space-y-0.5", depth > 0 && "ml-5 border-l border-border pl-2")}>
       {items.map((item) => {
@@ -217,6 +221,17 @@ function PlanTree({
                     {worker.title}
                   </span>
                 ))}
+                {comments?.counts.get(item.id) ? (
+                  <button
+                    type="button"
+                    onClick={() => comments.select(item.id)}
+                    className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                    aria-label={`Comments on ${item.id}`}
+                  >
+                    <Icon name="MessageSquare" className="size-3" />
+                    {comments.counts.get(item.id)}
+                  </button>
+                ) : null}
                 {item.note ? <p className="text-xs text-muted-foreground">{item.note}</p> : null}
               </div>
             </div>
@@ -460,6 +475,7 @@ function TaskPage({ taskId }: { taskId: string }) {
   const rpc = useBrief();
   const load = useCallback(() => rpc.call("task_get", { taskId }), [rpc, taskId]);
   const { data, error } = useLive(load);
+  const [itemFilter, setItemFilter] = useState<string | null>(null);
   useTick();
   if (error) return <ErrorText>{error}</ErrorText>;
   if (!data) return <EmptyState>Loading…</EmptyState>;
@@ -476,29 +492,136 @@ function TaskPage({ taskId }: { taskId: string }) {
           {task.finishedAt ? ` · finished ${ago(task.finishedAt)}` : ""}
         </p>
       </div>
-      <TaskBody task={task} />
-      <ActivityFeed task={task} events={events} />
+      <ItemComments.Provider value={{ counts: commentCounts(events), select: setItemFilter }}>
+        <TaskBody task={task} />
+      </ItemComments.Provider>
+      <ActivityFeed task={task} events={events} itemFilter={itemFilter} onClearFilter={() => setItemFilter(null)} />
     </div>
   );
 }
 
-function ActivityFeed({ task, events }: { task: Task; events: TaskEvent[] }) {
-  if (events.length === 0) return null;
-  const titles = new Map(task.threads.map((t) => [t.threadId, t.title]));
-  const many = task.threads.length > 1;
+function commentCounts(events: TaskEvent[]) {
+  const counts = new Map<string, number>();
+  for (const event of events) {
+    if (event.author !== "system" && event.itemId) counts.set(event.itemId, (counts.get(event.itemId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+const KIND_STYLE: Record<CommentKind, string> = {
+  update: "bg-muted text-muted-foreground",
+  decision: "bg-primary/15 text-primary",
+  finding: "bg-emerald-500/15 text-emerald-600",
+  question: "bg-amber-500/15 text-amber-600",
+};
+
+function CommentBox({ task, itemId }: { task: Task; itemId: string | null }) {
+  const rpc = useBrief();
+  const [text, setText] = useState("");
+  const [pending, setPending] = useState(false);
+  const owner = task.threads.find((t) => t.threadId === task.ownerThreadId);
+  const submit = async () => {
+    const body = text.trim();
+    if (!body || pending) return;
+    setPending(true);
+    try {
+      const result = await rpc.call("comment_add", { taskId: task.id, text: body, itemId });
+      setText("");
+      if (!result.delivered) toast.error(`Comment saved, but it could not be sent to the agent: ${result.error}`);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPending(false);
+    }
+  };
   return (
-    <section>
-      <SectionTitle>Activity</SectionTitle>
-      <ul className="space-y-1 text-xs text-muted-foreground">
-        {events.map((event, index) => (
-          <li key={`${event.at}-${index}`} className="flex gap-2">
-            <span className="w-14 shrink-0 tabular-nums">{ago(event.at)}</span>
-            <span className="min-w-0">
-              {event.text}
-              {many && event.threadId ? <span className="opacity-75"> · {titles.get(event.threadId) ?? "thread"}</span> : null}
-            </span>
-          </li>
-        ))}
+    <div className="space-y-2">
+      <textarea
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) void submit();
+        }}
+        rows={2}
+        placeholder={itemId ? `Comment on ${itemId}…` : "Comment on this task…"}
+        className="w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+        aria-label="Comment"
+      />
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+          {task.status === "open" && owner ? `Also sent to ${owner.title}` : "Saved on the task"}
+        </span>
+        <Button size="sm" className="h-7 text-xs" disabled={pending || text.trim() === ""} onClick={() => void submit()}>
+          Comment
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ActivityFeed({
+  task,
+  events,
+  itemFilter,
+  onClearFilter,
+}: {
+  task: Task;
+  events: TaskEvent[];
+  itemFilter: string | null;
+  onClearFilter: () => void;
+}) {
+  const [showSystem, setShowSystem] = useState(true);
+  const titles = new Map(task.threads.map((t) => [t.threadId, t.title]));
+  const visible = events.filter(
+    (e) => (itemFilter === null || e.itemId === itemFilter) && (showSystem || e.author !== "system"),
+  );
+  return (
+    <section className="space-y-3">
+      <div className="flex items-center gap-2">
+        <SectionTitle>Activity</SectionTitle>
+        {itemFilter ? (
+          <button type="button" onClick={onClearFilter} className="mb-2 rounded bg-muted px-1.5 py-0.5 text-xs hover:bg-muted/70">
+            on {itemFilter} ✕
+          </button>
+        ) : null}
+        <span className="flex-1" />
+        <button
+          type="button"
+          onClick={() => setShowSystem(!showSystem)}
+          className="mb-2 text-xs text-muted-foreground hover:text-foreground"
+        >
+          {showSystem ? "Comments only" : "Show all activity"}
+        </button>
+      </div>
+      <CommentBox task={task} itemId={itemFilter} />
+      <ul className="space-y-1.5">
+        {visible.map((event) =>
+          event.author === "system" ? (
+            <li key={event.id} className="flex gap-2 pl-1 text-xs text-muted-foreground">
+              <span className="w-14 shrink-0 tabular-nums">{ago(event.at)}</span>
+              <span className="min-w-0">
+                {event.text}
+                {task.threads.length > 1 && event.threadId ? (
+                  <span className="opacity-75"> · {titles.get(event.threadId) ?? "thread"}</span>
+                ) : null}
+              </span>
+            </li>
+          ) : (
+            <li key={event.id} className="rounded-lg border border-border bg-card p-3">
+              <div className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Icon name={event.author === "user" ? "User" : "Bot"} className="size-3.5" />
+                <span className="font-medium text-foreground">
+                  {event.author === "user" ? "You" : (titles.get(event.threadId ?? "") ?? "Agent")}
+                </span>
+                {event.kind ? <span className={cn("rounded px-1.5 py-0.5 text-[11px]", KIND_STYLE[event.kind])}>{event.kind}</span> : null}
+                {event.itemId ? <span>on {event.itemId}</span> : null}
+                <span className="ml-auto tabular-nums">{ago(event.at)}</span>
+              </div>
+              <Markdown content={event.text} className="text-sm" />
+            </li>
+          ),
+        )}
+        {visible.length === 0 ? <li className="text-xs text-muted-foreground">Nothing yet.</li> : null}
       </ul>
     </section>
   );

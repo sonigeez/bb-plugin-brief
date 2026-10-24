@@ -13,6 +13,8 @@ const threads = [
   makeThreadResponse({ id: "thr_other", projectId: "proj_a", title: "Loose", status: "active" }),
 ];
 
+const sent: { threadId: string; text: string }[] = [];
+
 async function setup(seed?: (kv: Map<string, unknown>) => void) {
   const kvSeed = new Map<string, unknown>();
   seed?.(kvSeed);
@@ -22,6 +24,10 @@ async function setup(seed?: (kv: Map<string, unknown>) => void) {
       threads: {
         get: async ({ threadId }: { threadId: string }) => threads.find((t) => t.id === threadId)!,
         list: async () => threads,
+        send: async ({ threadId, input }: { threadId: string; input: { text: string }[] }) => {
+          sent.push({ threadId, text: input[0]!.text });
+          return {};
+        },
       },
       environments: { get: async () => ({ id: "env_a", hostId: "host_a", path: "/work" }) },
       files: { read: async ({ path }: { path: string }) => ({ content: `# ${path}`, contentEncoding: "utf8" }) },
@@ -138,4 +144,30 @@ test("a thread you start yourself joins an existing task", async () => {
   await b.callRpc("thread_join", { threadId: "thr_other", taskId: mine.joinable.find((t) => t.title === "Other")!.id });
   mine = (await b.callRpc("thread_tasks", { threadId: "thr_other" })) as typeof mine;
   assert.equal(mine.current.title, "Other");
+});
+
+test("agents and you comment on a task; your comments reach the owner", async () => {
+  const b = await setup();
+  await b.callAgentTool("brief_plan", { title: "Ship v2", items: [{ text: "Server" }, { text: "UI" }] }, owner);
+  await b.callAgentTool("brief_comment", { text: "Kept **SQLite** for docs.", kind: "decision", item: "1" }, owner);
+  const bad = (await b.callAgentTool("brief_comment", { text: "x", item: "9" }, owner)) as { isError: boolean };
+  assert.equal(bad.isError, true);
+
+  const board = (await b.callRpc("board", null)) as { tasks: Task[] };
+  const taskId = board.tasks[0]!.id;
+  const result = (await b.callRpc("comment_add", { taskId, text: "Looks good, ship it", itemId: "2" })) as { delivered: boolean };
+  assert.equal(result.delivered, true);
+  assert.equal(sent.at(-1)!.threadId, "thr_owner");
+  assert.match(sent.at(-1)!.text, /Comment on task "Ship v2" \(item 2: UI\):\n\nLooks good, ship it/);
+
+  const { events } = (await b.callRpc("task_get", { taskId })) as { events: { author: string; kind: string | null; itemId: string | null; text: string }[] };
+  const comments = events.filter((e) => e.author !== "system");
+  assert.deepEqual(
+    comments.map((e) => [e.author, e.kind, e.itemId]),
+    [
+      ["user", null, "2"],
+      ["agent", "decision", "1"],
+    ],
+  );
+  assert.ok(events.some((e) => e.author === "system" && /Task started/.test(e.text)));
 });

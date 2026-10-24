@@ -13,6 +13,11 @@ it, and what it needs from you, on one board.
     publish, with every version kept.
 - A task page with the goal, the nested checklist (with the threads working
   on each item), each thread's status, the docs, and the activity feed.
+- **Comments** in the activity feed. Agents comment on decisions, findings,
+  dead ends, and questions, and you can comment from the task page. Your
+  comment is also sent to the task's owner thread, queued behind any running
+  turn. A comment can be about one checklist item, and that item then shows
+  its comment count.
 - A **Brief** tab in the thread side panel showing the thread's current task
   and its earlier ones, and a progress pill in the thread header.
 
@@ -30,7 +35,7 @@ and the old one is kept in Done so far.
 `brief_plan` (start a task or set its plan; `new_task` to switch),
 `brief_item` (tick items), `brief_claim` (a helper takes an item), `brief_join` (join an open task by
 name),
-`brief_status` (the now line and the needs-you flag, which clears itself when
+`brief_comment` (add a comment to the activity feed), `brief_status` (the now line and the needs-you flag, which clears itself when
 you reply), and `brief_doc` (publish a markdown file).
 
 ## How it works
